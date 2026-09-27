@@ -3,7 +3,7 @@ mod errors;
 mod events;
 mod types;
 use errors::ScoutAccessError;
-use types::{ContactRecord, DataKey, ProContactPeriod, Subscription, TrialEscrow, TrialOffer};
+use types::{ContactRecord, DataKey, FeeConfigHistoryEntry, FeeConfigSource, ProContactPeriod, Subscription, TrialEscrow, TrialOffer};
 pub use types::{FeeConfig, SubscriptionTier};
 
 use soroban_sdk::{contract, contractimpl, token, Address, Env, String, Vec};
@@ -73,6 +73,10 @@ const TRIAL_OFFER_COOLDOWN_SECS: u64 = 86_400; // 24 hours
 const MIN_CONTACT_FEE_STROOPS: i128 = 100_000; // 0.01 XLM
 const MIN_SUB_FEE_STROOPS: i128 = 1_000_000; // 0.1 XLM
 
+// Maximum number of fee-config history entries kept in the ring-buffer.
+// Oldest entries are evicted when the cap is exceeded (instance storage bounded).
+const FEE_CONFIG_HISTORY_CAP: u32 = 5;
+
 #[contract]
 pub struct ScoutAccessContract;
 
@@ -135,13 +139,7 @@ impl ScoutAccessContract {
         let admin = require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
         Self::validate_fee_config(&fee_config)?;
 
-        let old_config = Self::fee_config(&env);
-
-        env.storage()
-            .instance()
-            .set(&DataKey::FeeConfig, &fee_config);
-
-        events::fee_config_updated(&env, &admin, &old_config, &fee_config);
+        Self::apply_fee_config(&env, &admin, &fee_config, FeeConfigSource::Immediate);
         Ok(())
     }
 
@@ -1062,6 +1060,20 @@ impl ScoutAccessContract {
         Self::fee_config(&env)
     }
 
+    /// Returns the last up-to-`FEE_CONFIG_HISTORY_CAP` fee-config activations
+    /// in chronological order (oldest first). Returns an empty vec if no
+    /// fee-config changes have been made since the contract was deployed with
+    /// this version.
+    pub fn get_fee_config_history(
+        env: Env,
+    ) -> soroban_sdk::Vec<FeeConfigHistoryEntry> {
+        Self::bump_instance_ttl(&env);
+        env.storage()
+            .instance()
+            .get(&DataKey::FeeConfigHistory)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(&env))
+    }
+
     pub fn get_accumulated_fees(env: Env) -> i128 {
         Self::bump_instance_ttl(&env);
         env.storage()
@@ -1418,6 +1430,47 @@ impl ScoutAccessContract {
             return Err(ScoutAccessError::InvalidInput);
         }
         Ok(())
+    }
+
+    /// Replace the active fee configuration, append a `FeeConfigHistoryEntry`
+    /// to the ring-buffer (capped at `FEE_CONFIG_HISTORY_CAP`), and emit
+    /// `fee_config_updated`.
+    ///
+    /// All public fee-config activation paths (`update_fee_config`,
+    /// `propose_fee_config` decrease branch, `activate_fee_config`,
+    /// `admin_seed_fee_config`) must go through this helper so that
+    /// `get_fee_config_history` captures every real fee change.
+    fn apply_fee_config(
+        env: &Env,
+        admin: &Address,
+        new_config: &FeeConfig,
+        source: FeeConfigSource,
+    ) {
+        let old_config = Self::fee_config(env);
+        env.storage()
+            .instance()
+            .set(&DataKey::FeeConfig, new_config);
+
+        // Append to history ring-buffer, evicting the oldest entry when full.
+        let mut history: soroban_sdk::Vec<FeeConfigHistoryEntry> = env
+            .storage()
+            .instance()
+            .get(&DataKey::FeeConfigHistory)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(env));
+        let entry = FeeConfigHistoryEntry {
+            config: new_config.clone(),
+            activated_at: env.ledger().timestamp(),
+            source,
+        };
+        history.push_back(entry);
+        while history.len() > FEE_CONFIG_HISTORY_CAP {
+            history.remove(0);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::FeeConfigHistory, &history);
+
+        events::fee_config_updated(env, admin, &old_config, new_config);
     }
 
     /// Numeric rank for a subscription tier (higher = more privileged).
@@ -2646,6 +2699,50 @@ mod tests {
         assert!(result.is_ok());
         let stored = client.get_fee_config();
         assert_eq!(stored.contact_fee_stroops, 200_000);
+    }
+
+    #[test]
+    fn test_update_fee_config_appends_history() {
+        let (_, _, _, _, client) = setup();
+        let new_fees = FeeConfig {
+            contact_fee_stroops: 200_000,
+            basic_sub_stroops: 2_000_000,
+            pro_sub_stroops: 5_000_000,
+            elite_sub_stroops: 10_000_000,
+            sub_duration_secs: 60 * 24 * 60 * 60,
+            pro_contact_limit: 15,
+            trial_offer_escrow_stroops: 1_000_000,
+            trial_offer_expiry_secs: 7_200,
+        };
+        client.update_fee_config(&new_fees);
+        let history = client.get_fee_config_history();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history.get(0).unwrap().config.contact_fee_stroops, 200_000);
+    }
+
+    #[test]
+    fn test_fee_config_history_capped_at_five() {
+        let (_, _, _, _, client) = setup();
+        for i in 1u32..=6 {
+            let fees = FeeConfig {
+                contact_fee_stroops: i as i128 * 100_000,
+                ..default_fees()
+            };
+            client.update_fee_config(&fees);
+        }
+        let history = client.get_fee_config_history();
+        // Ring-buffer is capped at 5; the first entry (i=1) is evicted.
+        assert_eq!(history.len(), 5);
+        // Oldest remaining entry is i=2 (200_000), most recent is i=6 (600_000).
+        assert_eq!(history.get(0).unwrap().config.contact_fee_stroops, 200_000);
+        assert_eq!(history.get(4).unwrap().config.contact_fee_stroops, 600_000);
+    }
+
+    #[test]
+    fn test_fee_config_history_empty_before_any_update() {
+        let (_, _, _, _, client) = setup();
+        let history = client.get_fee_config_history();
+        assert_eq!(history.len(), 0);
     }
 
     // -------------------------------------------------------------------------
